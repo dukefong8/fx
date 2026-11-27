@@ -116,7 +116,7 @@ async (Fx m) =
     -- this thread's own fork-then-register steps; a concurrent abandon
     -- snapshot from the waiter can still land between them and miss the
     -- child. Best-effort only.
-    atomically (modifyTVar' live ((tid, True) :))
+    atomically (modifyTVar' live ((tid, BodyPhase) :))
 
     return $ Future (Just tid) $ Compose $ readTMVar futureVar
 

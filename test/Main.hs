@@ -310,6 +310,62 @@ main = hspec do
     finished <- pollUntil 2000000 (readIORef finishedRef)
     finished `shouldBe` True
 
+  it "Abandoned run absorbs a kill pending at cleanup entry" do
+    startedVar <- newEmptyMVar
+    gateVar <- newEmptyMVar
+    releasedRef <- newIORef False
+    let scope :: Scope Void ()
+        scope = do
+          _ <- acquire (pure () :: Fx () Void ())
+          _ <- registerRelease (runTotalIO (\_ -> writeIORef releasedRef True) :: Fx () Void ())
+          pure ()
+        body :: Fx () Void ()
+        body =
+          runTotalIO $ \_ ->
+            uninterruptibleMask_ do
+              putMVar startedVar ()
+              takeMVar gateVar
+    runner <- forkIO (runFx (scoping scope body) >> pure ())
+    takeMVar startedVar
+    killThread runner
+    -- Let the sweep claim the worker and send the kill while it is masked,
+    -- so the kill is pending when the release starts.
+    threadDelay 50000
+    putMVar gateVar ()
+    released <- pollUntil 2000000 (readIORef releasedRef)
+    released `shouldBe` True
+
+  it "Abandoned run keeps a nested release protected" do
+    tailStartedVar <- newEmptyMVar
+    tailGateVar <- newEmptyMVar
+    finishedRef <- newIORef False
+    let inner :: Scope Void ()
+        inner = do
+          _ <- acquire (pure () :: Fx () Void ())
+          _ <- registerRelease (pure () :: Fx () Void ())
+          pure ()
+        outer :: Scope Void ()
+        outer = do
+          _ <- acquire (pure () :: Fx () Void ())
+          _ <- registerRelease
+            ( (scoping inner (pure ()))
+                >> ( runTotalIO $ \_ -> do
+                       putMVar tailStartedVar ()
+                       takeMVar tailGateVar
+                       writeIORef finishedRef True
+                   )
+            )
+          pure ()
+        body :: Fx () Void ()
+        body = pure ()
+    runner <- forkIO (runFx (scoping outer body) >> pure ())
+    takeMVar tailStartedVar
+    killThread runner
+    threadDelay 50000
+    putMVar tailGateVar ()
+    finished <- pollUntil 2000000 (readIORef finishedRef)
+    finished `shouldBe` True
+
   it "Custom async in a future child surfaces with the async reason" do
     -- A non-ThreadKilled asynchronous exception must still fill the future,
     -- or an awaiter would see an STM-blocked bug instead of the child failure.
