@@ -41,6 +41,8 @@ data FxEnv env
       (forall a. IO a -> IO a)
       -- | Crash.
       (CallStack -> [ThreadId] -> FxExceptionReason -> IO ())
+      -- | Threads forked by the current run.
+      (TVar [ThreadId])
       -- | User environment.
       env
 
@@ -90,12 +92,12 @@ deriving instance (Monoid err) => MonadPlus (Fx env err)
 instance MonadFail (Fx env err) where
   fail msg = Fx $
     ReaderT $
-      \(FxEnv _ crash _) -> liftIO $ do
+      \(FxEnv _ crash _ _) -> liftIO $ do
         crash callStack [] (ErrorCallFxExceptionReason (ErrorCall msg))
         fail "Crashed"
 
 instance MonadIO (Fx env SomeException) where
-  liftIO io = Fx $ ReaderT $ \(FxEnv unmask _ _) -> ExceptT $
+  liftIO io = Fx $ ReaderT $ \(FxEnv unmask _ _ _) -> ExceptT $
     (Right <$> unmask io) `catch` \(e :: SomeException) ->
       case fromException e of
         Just (SomeAsyncException _) -> throwIO e
@@ -133,13 +135,14 @@ runFxInIO :: (HasCallStack) => Fx () Void res -> IO res
 runFxInIO (Fx m) = uninterruptibleMask $ \unmask -> do
   fatalErrChan <- newTQueueIO
   resVar <- newEmptyTMVarIO
+  liveThreads <- newTVarIO []
 
-  _ <- forkIO $ do
+  workerTid <- forkIO $ do
     tid <- myThreadId
 
     finalize <-
       let crash stack tids reason = atomically (writeTQueue fatalErrChan (FxException (tid : tids) reason stack))
-          fxEnv = FxEnv unmask crash ()
+          fxEnv = FxEnv unmask crash liveThreads ()
        in catch
             ( do
                 resOrVoid <- runExceptT (runReaderT m fxEnv)
@@ -170,6 +173,10 @@ runFxInIO (Fx m) = uninterruptibleMask $ \unmask -> do
     -- Throw errors or post the result
     finalize
 
+  -- Registered by this thread, under the entry mask, so the kill sweep can
+  -- never miss the worker between fork and its first instruction.
+  atomically (modifyTVar' liveThreads (workerTid :))
+
   -- Wait for fatal error or result
   join $
     catch
@@ -186,9 +193,25 @@ runFxInIO (Fx m) = uninterruptibleMask $ \unmask -> do
       )
       ( \(exc :: SomeException) ->
           case fromException exc of
-            Just (exc :: AsyncException) -> throwIO exc
-            _ -> throwIO (FxException [] (BugFxExceptionReason (Strings.failedWaitingForFinalResult exc)) callStack)
+            -- The waiter was abandoned from outside. Kill the worker's threads
+            -- before leaving so no thread outlives this run.
+            Just (asyncExc :: AsyncException) -> do
+              abandonRun liveThreads
+              throwIO asyncExc
+            _ ->
+              throwIO (FxException [] (BugFxExceptionReason (Strings.failedWaitingForFinalResult exc)) callStack)
       )
+
+-- |
+-- Terminate every thread registered by the current run.
+--
+-- Each kill is delivered before the next one is issued, so a thread that is
+-- blocked in an uninterruptible foreign call delays the remaining kills.
+-- That is the same best-effort delivery `cancel` already relies on.
+abandonRun :: TVar [ThreadId] -> IO ()
+abandonRun liveThreads = uninterruptibleMask_ $ do
+  tids <- atomically (readTVar liveThreads)
+  mapM_ (\tid -> killThread tid `catch` \(_ :: SomeException) -> pure ()) tids
 
 -- |
 -- Turn a non-failing IO action into an effect.
@@ -201,7 +224,7 @@ runFxInIO (Fx m) = uninterruptibleMask $ \unmask -> do
 runTotalIO :: (env -> IO res) -> Fx env err res
 runTotalIO io = Fx $
   ReaderT $
-    \(FxEnv unmask crash env) ->
+    \(FxEnv unmask crash _ env) ->
       lift $
         catch
           (unmask (io env))
@@ -233,7 +256,7 @@ runExceptionalIO :: (Exception exc) => (env -> IO res) -> Fx env exc res
 runExceptionalIO io =
   Fx $
     ReaderT $
-      \(FxEnv unmask crash env) -> ExceptT $
+      \(FxEnv unmask crash _ env) -> ExceptT $
         catch (fmap Right (unmask (io env))) $
           \exc -> case fromException exc of
             Just exc' -> return (Left exc')
@@ -250,8 +273,8 @@ mapEnv :: (b -> a) -> Fx a err res -> Fx b err res
 mapEnv fn (Fx m) =
   Fx $
     ReaderT $
-      \(FxEnv unmask crash env) ->
-        runReaderT m (FxEnv unmask crash (fn env))
+      \(FxEnv unmask crash live env) ->
+        runReaderT m (FxEnv unmask crash live (fn env))
 
 -- * Classes
 

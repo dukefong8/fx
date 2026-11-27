@@ -1,5 +1,6 @@
 module Main where
 
+import Control.Monad (forever)
 import Control.Monad.Parallel (bindM2)
 import Fx
 import Test.Hspec
@@ -234,6 +235,34 @@ main = hspec do
       Left exc -> expectationFailure ("Wrong reason: " ++ show exc)
       Right _ -> expectationFailure "Kill was swallowed as a value"
 
+  it "Abandoned run cleans up and leaves no running threads" do
+    releasedRef <- newIORef False
+    ticksRef <- newIORef (0 :: Int)
+    startedVar <- newEmptyMVar
+    let scope :: Scope Void ()
+        scope = do
+          _ <- acquire (pure () :: Fx () Void ())
+          _ <- registerRelease (runTotalIO (\_ -> writeIORef releasedRef True) :: Fx () Void ())
+          pure ()
+        spinningChild =
+          runTotalIO $ \_ -> forever (threadDelay 10000 >> modifyIORef' ticksRef (+ 1))
+        blockingBody = do
+          runTotalIO $ \_ -> putMVar startedVar ()
+          runTotalIO (\_ -> threadDelay 10000000)
+        body :: Fx () Void ()
+        body = void $ bindM2 (\_ _ -> pure ()) spinningChild blockingBody
+    runner <- forkIO (runFx (scoping scope body) >> pure ())
+    takeMVar startedVar
+    killThread runner
+    -- Cleanup runs on the abandoned run.
+    releaseSeen <- pollUntil 2000000 (readIORef releasedRef)
+    releaseSeen `shouldBe` True
+    -- No thread keeps working after the run was abandoned.
+    firstSample <- readIORef ticksRef
+    threadDelay 300000
+    secondSample <- readIORef ticksRef
+    firstSample `shouldBe` secondSample
+
   it "Custom async in a future child surfaces with the async reason" do
     -- A non-ThreadKilled asynchronous exception must still fill the future,
     -- or an awaiter would see an STM-blocked bug instead of the child failure.
@@ -256,6 +285,15 @@ data ReviewAsyncException = ReviewAsyncException String
 instance Exception ReviewAsyncException where
   toException = asyncExceptionToException
   fromException = asyncExceptionFromException
+
+pollUntil :: Int -> IO Bool -> IO Bool
+pollUntil micros check
+  | micros <= 0 = check
+  | otherwise = do
+      ok <- check
+      if ok
+        then return True
+        else threadDelay 10000 >> pollUntil (micros - 10000) check
 
 testException :: Fx () Void a -> (FxException -> Bool) -> IO ()
 testException fx validateExc = do

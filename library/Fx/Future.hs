@@ -62,16 +62,20 @@ mapImpl fn (Future tid m) = Future tid (fn m)
 -- To achieve that use `await`.
 async :: Fx env err res -> Fx env err' (Future err res)
 async (Fx m) =
-  Fx $ ReaderT $ \(FxEnv unmask crash env) -> lift $ do
+  Fx $ ReaderT $ \(FxEnv unmask crash live env) -> lift $ do
     futureVar <- newEmptyTMVarIO
 
     let handler = \case
-          ThreadKilled -> void $ atomically (tryPutTMVar futureVar (Left Nothing))
+          ThreadKilled -> do
+            self <- myThreadId
+            atomically (modifyTVar' live (filter (/= self)))
+            void $ atomically (tryPutTMVar futureVar (Left Nothing))
           exc -> throwIO exc
     tid <- forkIO $ handle handler do
       tid <- myThreadId
 
       let childCrash stack tids dls = crash stack (tid : tids) dls
+          unregister = atomically (modifyTVar' live (filter (/= tid)))
 
           -- Only `ThreadKilled` goes to the outer handler, which ends
           -- the future empty without a fatal failure. Any other
@@ -88,18 +92,28 @@ async (Fx m) =
             | otherwise =
                 childCrash callStack [] (BugFxExceptionReason (Strings.unexpectedException exc))
 
+      -- Unregistered on the way out of either outcome. The child is registered
+      -- by its parent before this runs, so the run's kill sweep can never miss
+      -- it between fork and its first instruction.
       finalize <-
         catch
           ( do
-              res <- runExceptT (runReaderT m (FxEnv unmask childCrash env))
-              return (atomically (putTMVar futureVar (first Just res)))
+              res <- runExceptT (runReaderT m (FxEnv unmask childCrash live env))
+              return $ do
+                unregister
+                atomically (putTMVar futureVar (first Just res))
           )
           ( \exc -> return $ do
+              unregister
               handle exc
               atomically (putTMVar futureVar (Left Nothing))
           )
 
       finalize
+
+    -- Registered by the spawning thread, which holds the run's mask, so the
+    -- kill sweep can never miss the child between fork and its first instruction.
+    atomically (modifyTVar' live (tid :))
 
     return $ Future (Just tid) $ Compose $ readTMVar futureVar
 
@@ -107,7 +121,7 @@ async (Fx m) =
 -- Block until the future completes either with a result or an error.
 await :: Future err res -> Fx env err res
 await (Future _ m) =
-  Fx $ ReaderT $ \(FxEnv unmask crash _) ->
+  Fx $ ReaderT $ \(FxEnv unmask crash _ _) ->
     ExceptT $
       join $
         catch
