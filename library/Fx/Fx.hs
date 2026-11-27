@@ -159,8 +159,10 @@ runFxInIO (Fx m) = uninterruptibleMask $ \unmask -> do
   fatalErrChan <- newTQueueIO
   resVar <- newEmptyTMVarIO
   liveThreads <- newTVarIO []
+  workerReady <- newEmptyMVar
 
   workerTid <- forkIO $ do
+    takeMVar workerReady
     tid <- myThreadId
 
     finalize <-
@@ -196,11 +198,11 @@ runFxInIO (Fx m) = uninterruptibleMask $ \unmask -> do
     -- Throw errors or post the result
     finalize
 
-  -- Registered by this thread, under the entry mask, so the kill sweep can
-  -- never miss the worker between fork and its first instruction: the same
-  -- thread registers before it can reach the wait that abandons, and the mask
-  -- keeps those steps ordered.
+  -- Registered by this thread under the entry mask before releasing the
+  -- worker, so the worker cannot enter cleanup before registration and the
+  -- sweep cannot miss it between fork and its first instruction.
   atomically (modifyTVar' liveThreads ((workerTid, BodyPhase) :))
+  putMVar workerReady ()
 
   -- Wait for fatal error or result
   join $

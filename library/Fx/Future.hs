@@ -64,59 +64,70 @@ async :: Fx env err res -> Fx env err' (Future err res)
 async (Fx m) =
   Fx $ ReaderT $ \(FxEnv unmask crash live env) -> lift $ do
     futureVar <- newEmptyTMVarIO
+    childReady <- newEmptyMVar
 
-    let handler = \case
+    let removeThread tid = go
+          where
+            go [] = []
+            go (entry@(t, _) : xs)
+              | t == tid = xs
+              | otherwise = let !xs' = go xs in entry : xs'
+        handler = \case
           ThreadKilled -> do
             self <- myThreadId
-            atomically (modifyTVar' live (filter ((/= self) . fst)))
+            atomically (modifyTVar' live (removeThread self))
             void $ atomically (tryPutTMVar futureVar (Left Nothing))
           exc -> throwIO exc
-    tid <- forkIO $ handle handler do
-      tid <- myThreadId
+    tid <- uninterruptibleMask_ $ do
+      tid <- forkIO $ handle handler do
+        takeMVar childReady
+        tid <- myThreadId
 
-      let childCrash stack tids dls = crash stack (tid : tids) dls
-          unregister = atomically (modifyTVar' live (filter ((/= tid) . fst)))
+        let childCrash stack tids dls = crash stack (tid : tids) dls
+            unregister = atomically (modifyTVar' live (removeThread tid))
 
-          -- Only `ThreadKilled` goes to the outer handler, which ends
-          -- the future empty without a fatal failure. Any other
-          -- asynchronous exception is posted as a fatal failure here,
-          -- so an awaiter sees it instead of an uncaught exception
-          -- leaving the future unfilled.
-          handle exc
-            | Just ThreadKilled <- fromException exc =
-                throwIO exc
-            | Just (asyncExc :: SomeAsyncException) <- fromException exc =
-                childCrash callStack [] (AsyncFxExceptionReason asyncExc)
-            | Just errorCall <- fromException exc =
-                childCrash callStack [] (ErrorCallFxExceptionReason errorCall)
-            | otherwise =
-                childCrash callStack [] (BugFxExceptionReason (Strings.unexpectedException exc))
+            -- Only `ThreadKilled` goes to the outer handler, which ends
+            -- the future empty without a fatal failure. Any other
+            -- asynchronous exception is posted as a fatal failure here,
+            -- so an awaiter sees it instead of an uncaught exception
+            -- leaving the future unfilled.
+            handle exc
+              | Just ThreadKilled <- fromException exc =
+                  throwIO exc
+              | Just (asyncExc :: SomeAsyncException) <- fromException exc =
+                  childCrash callStack [] (AsyncFxExceptionReason asyncExc)
+              | Just errorCall <- fromException exc =
+                  childCrash callStack [] (ErrorCallFxExceptionReason errorCall)
+              | otherwise =
+                  childCrash callStack [] (BugFxExceptionReason (Strings.unexpectedException exc))
 
-      -- Unregistered on the way out of either outcome. The parent registers
-      -- the child before this runs, which narrows but does not close the
-      -- fork-to-register window: a concurrent abandon snapshot can land
-      -- between them and miss the child. Best-effort only.
-      finalize <-
-        catch
-          ( do
-              res <- runExceptT (runReaderT m (FxEnv unmask childCrash live env))
-              return $ do
+        -- Unregistered on the way out of either outcome. The child waits on
+        -- `childReady` until the parent has registered it, so unregister
+        -- always finds the entry and cleanup cannot precede registration.
+        -- A concurrent abandon snapshot from the waiter can still land
+        -- between fork and register and miss the child (best-effort only).
+        finalize <-
+          catch
+            ( do
+                res <- runExceptT (runReaderT m (FxEnv unmask childCrash live env))
+                return $ do
+                  unregister
+                  atomically (putTMVar futureVar (first Just res))
+            )
+            ( \exc -> return $ do
                 unregister
-                atomically (putTMVar futureVar (first Just res))
-          )
-          ( \exc -> return $ do
-              unregister
-              handle exc
-              atomically (putTMVar futureVar (Left Nothing))
-          )
+                handle exc
+                atomically (putTMVar futureVar (Left Nothing))
+            )
 
-      finalize
+        finalize
 
-    -- Registered by the spawning thread while masked. The mask only orders
-    -- this thread's own fork-then-register steps; a concurrent abandon
-    -- snapshot from the waiter can still land between them and miss the
-    -- child. Best-effort only.
-    atomically (modifyTVar' live ((tid, BodyPhase) :))
+      -- Registered before releasing `childReady` so the child never runs
+      -- ahead of registration. A concurrent abandon snapshot from the waiter
+      -- can still land between fork and register and miss the child.
+      atomically (modifyTVar' live ((tid, BodyPhase) :))
+      putMVar childReady ()
+      pure tid
 
     return $ Future (Just tid) $ Compose $ readTMVar futureVar
 
