@@ -375,6 +375,41 @@ main = hspec do
     finished <- pollUntil 2000000 (readIORef finishedRef)
     finished `shouldBe` True
 
+  it "An async exception during a release leaves the release running" do
+    startedRef <- newIORef False
+    finishedRef <- newIORef False
+    workerTidRef <- newIORef Nothing
+    spinCountRef <- newIORef (20000000 :: Int)
+    helperGo <- newEmptyMVar
+    let spin :: Int -> Integer
+        spin n = go n 0
+          where
+            go 0 acc = acc
+            go k acc = go (k - 1) ((acc * 31 + fromIntegral (k `mod` 7)) `mod` 1000003)
+        scope :: Scope Void ()
+        scope = do
+          _ <- acquire (pure () :: Fx () Void ())
+          _ <- registerRelease ((runTotalIO $ \_ -> do
+            tid <- myThreadId
+            writeIORef workerTidRef (Just tid)
+            writeIORef startedRef True
+            n <- readIORef spinCountRef
+            spin n `seq` pure ()
+            writeIORef finishedRef True) :: Fx () Void ())
+          pure ()
+        body :: Fx () Void ()
+        body = pure ()
+    forkIO (runFx (scoping scope body) >> pure ()) >> pure ()
+    started <- pollUntil 2000000 (readIORef startedRef)
+    started `shouldBe` True
+    Just workerTid <- readIORef workerTidRef
+    _ <- forkIO $ do
+      putMVar helperGo ()
+      throwTo workerTid (ReviewAsyncException "during-release")
+    takeMVar helperGo
+    finished <- pollUntil 2000000 (readIORef finishedRef)
+    finished `shouldBe` True
+
   it "Abandoned run keeps a nested release protected" do
     tailStartedVar <- newEmptyMVar
     tailGateVar <- newEmptyMVar

@@ -32,18 +32,18 @@ instance Applicative (Scope err) where
 instance Monad (Scope err) where
   return = pure
   Scope (Fx m1) >>= f =
-    Scope $ Fx $ ReaderT $ \(FxEnv unmask crash live ()) -> ExceptT $ do
-      r1 <- runExceptT (runReaderT m1 (FxEnv unmask crash live ()))
+    Scope $ Fx $ ReaderT $ \(FxEnv runIO unmask crash live ()) -> ExceptT $ do
+      r1 <- runExceptT (runReaderT m1 (FxEnv runIO unmask crash live ()))
       case r1 of
         Left e -> pure (Left e)
         -- Teardown dispatch is pinned so it does not depend on the ambient mask.
         Right (env, Fx rel1) -> uninterruptibleMask_ $ do
           let runRel1 =
                 withCleanupPhase unmask live $
-                  void (runExceptT (runReaderT rel1 (FxEnv unmask crash live ())))
+                  void (runExceptT (runReaderT rel1 (FxEnv runIO unmask crash live ())))
           r2 <- (do
             Scope (Fx m2) <- evaluate (f env)
-            runExceptT (runReaderT m2 (FxEnv unmask crash live ()))
+            runExceptT (runReaderT m2 (FxEnv runIO unmask crash live ()))
             ) `onException` runRel1
           case r2 of
             Left e2 -> runRel1 >> pure (Left e2)
@@ -55,17 +55,17 @@ instance Monad (Scope err) where
 -- the second still runs, and a throw from the second replaces the first.
 andReleases :: Fx () err () -> Fx () err () -> Fx () err ()
 andReleases (Fx later) (Fx earlier) =
-  Fx $ ReaderT $ \(FxEnv unmask crash live ()) -> ExceptT $
+  Fx $ ReaderT $ \(FxEnv runIO unmask crash live ()) -> ExceptT $
     uninterruptibleMask_ $ do
       firstResult <-
-        runExceptT (runReaderT later (FxEnv unmask crash live ()))
-          `onException` void (runExceptT (runReaderT earlier (FxEnv unmask crash live ())))
+        runExceptT (runReaderT later (FxEnv runIO unmask crash live ()))
+          `onException` void (runExceptT (runReaderT earlier (FxEnv runIO unmask crash live ())))
       case firstResult of
         Left firstError -> do
-          _ <- runExceptT (runReaderT earlier (FxEnv unmask crash live ()))
+          _ <- runExceptT (runReaderT earlier (FxEnv runIO unmask crash live ()))
           pure (Left firstError)
         Right () ->
-          runExceptT (runReaderT earlier (FxEnv unmask crash live ()))
+          runExceptT (runReaderT earlier (FxEnv runIO unmask crash live ()))
 
 instance Bifunctor Scope where
   bimap lf rf (Scope m) = Scope (bimap lf (bimap rf (first lf)) m)
@@ -124,17 +124,21 @@ scoping :: Scope err env -> Fx env err res -> Fx env' err res
 scoping (Scope (Fx acquire)) (Fx fx) =
   Fx $
     ReaderT $
-      \(FxEnv unmask crash live _) -> ExceptT $ uninterruptibleMask_ $ do
-        let providerFxEnv = FxEnv unmask crash live ()
-        acquisition <- runExceptT (runReaderT acquire providerFxEnv)
+      \(FxEnv _ unmask crash live _) -> ExceptT $ uninterruptibleMask_ $ do
+        -- Acquisition and release run under 'MaskedInterruptible', the
+        -- standard 'bracket' masking state: asynchronous exceptions are
+        -- deferred between steps but can still interrupt a blocking
+        -- operation. The body keeps the ambient unmasking policy.
+        let cleanupFxEnv = FxEnv mask_ unmask crash live ()
+        acquisition <- runExceptT (runReaderT acquire cleanupFxEnv)
         case acquisition of
           Left err -> return (Left err)
           -- Everything from acquisition on stays inside 'uninterruptibleMask_'
           -- so a cancel cannot skip cleanup between acquisition, the body and
-          -- the release. Release leaves still unmask via 'unmask' by design.
+          -- the release. Release leaves still unmask via 'mask_'.
           Right (env, (Fx release)) -> do
-            let runRelease = runExceptT (runReaderT release providerFxEnv)
-            resOrErr <- runExceptT (runReaderT fx (FxEnv unmask crash live env)) `onException` withCleanupPhase unmask live runRelease
+            let runRelease = runExceptT (runReaderT release cleanupFxEnv)
+            resOrErr <- runExceptT (runReaderT fx (FxEnv unmask unmask crash live env)) `onException` withCleanupPhase unmask live runRelease
             releasing <- withCleanupPhase unmask live runRelease
             return (resOrErr <* releasing)
 
@@ -193,9 +197,9 @@ closeEnv :: env -> Fx env err res -> Fx env' err res
 closeEnv env (Fx fx) =
   Fx $
     ReaderT $
-      \(FxEnv unmask crash live _) ->
+      \(FxEnv runIO unmask crash live _) ->
         ExceptT $
-          runExceptT (runReaderT fx (FxEnv unmask crash live env))
+          runExceptT (runReaderT fx (FxEnv runIO unmask crash live env))
 
 instance RunsFx () err (Scope err) where
   runFx fx = Scope (fmap (\env -> (env, pure ())) fx)

@@ -62,7 +62,7 @@ mapImpl fn (Future tid m) = Future tid (fn m)
 -- To achieve that use `await`.
 async :: Fx env err res -> Fx env err' (Future err res)
 async (Fx m) =
-  Fx $ ReaderT $ \(FxEnv unmask crash live env) -> lift $ do
+  Fx $ ReaderT $ \(FxEnv runIO unmask crash live env) -> lift $ do
     futureVar <- newEmptyTMVarIO
     childReady <- newEmptyMVar
 
@@ -109,7 +109,7 @@ async (Fx m) =
         finalize <-
           catch
             ( do
-                res <- runExceptT (runReaderT m (FxEnv unmask childCrash live env))
+                res <- runExceptT (runReaderT m (FxEnv runIO unmask childCrash live env))
                 return $ do
                   unregister
                   atomically (putTMVar futureVar (first Just res))
@@ -135,7 +135,7 @@ async (Fx m) =
 -- Block until the future completes either with a result or an error.
 await :: Future err res -> Fx env err res
 await (Future _ m) =
-  Fx $ ReaderT $ \(FxEnv unmask crash _ _) ->
+  Fx $ ReaderT $ \(FxEnv _ unmask crash _ _) ->
     ExceptT $
       join $
         catch

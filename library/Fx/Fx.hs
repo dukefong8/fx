@@ -67,7 +67,9 @@ initialThreadPhase = ThreadPhase 0 Unclaimed
 -- Runtime and application environment.
 data FxEnv env
   = FxEnv
-      -- | Unmasking function.
+      -- | Masking policy for user IO in the current context.
+      (forall a. IO a -> IO a)
+      -- | Restore the ambient masking state, used to absorb a claimed kill.
       (forall a. IO a -> IO a)
       -- | Crash.
       (CallStack -> [ThreadId] -> FxExceptionReason -> IO ())
@@ -124,13 +126,13 @@ deriving instance (Monoid err) => MonadPlus (Fx env err)
 instance MonadFail (Fx env err) where
   fail msg = Fx $
     ReaderT $
-      \(FxEnv _ crash _ _) -> liftIO $ do
+      \(FxEnv _ _ crash _ _) -> liftIO $ do
         crash callStack [] (ErrorCallFxExceptionReason (ErrorCall msg))
         fail "Crashed"
 
 instance MonadIO (Fx env SomeException) where
-  liftIO io = Fx $ ReaderT $ \(FxEnv unmask _ _ _) -> ExceptT $
-    (Right <$> unmask io) `catch` \(e :: SomeException) ->
+  liftIO io = Fx $ ReaderT $ \(FxEnv runIO _ _ _ _) -> ExceptT $
+    (Right <$> runIO io) `catch` \(e :: SomeException) ->
       case fromException e of
         Just (SomeAsyncException _) -> throwIO e
         Nothing                     -> pure (Left e)
@@ -176,7 +178,7 @@ runFxInIO (Fx m) = uninterruptibleMask $ \unmask -> do
 
     finalize <-
       let crash stack tids reason = atomically (writeTQueue fatalErrChan (FxException (tid : tids) reason stack))
-          fxEnv = FxEnv unmask crash liveThreads ()
+          fxEnv = FxEnv unmask unmask crash liveThreads ()
        in catch
             ( do
                 resOrVoid <- runExceptT (runReaderT m fxEnv)
@@ -333,10 +335,10 @@ absorbClaim unmask liveThreads = do
 runTotalIO :: (env -> IO res) -> Fx env err res
 runTotalIO io = Fx $
   ReaderT $
-    \(FxEnv unmask crash _ env) ->
+    \(FxEnv runIO _ crash _ env) ->
       lift $
         catch
-          (unmask (io env))
+          (runIO (io env))
           ( \(exc :: SomeException) -> do
               case fromException exc of
                 Just (asyncExc :: SomeAsyncException) -> throwIO asyncExc
@@ -365,8 +367,8 @@ runExceptionalIO :: (Exception exc) => (env -> IO res) -> Fx env exc res
 runExceptionalIO io =
   Fx $
     ReaderT $
-      \(FxEnv unmask crash _ env) -> ExceptT $
-        catch (fmap Right (unmask (io env))) $
+      \(FxEnv runIO _ crash _ env) -> ExceptT $
+        catch (fmap Right (runIO (io env))) $
           \exc -> case fromException exc of
             Just exc' -> return (Left exc')
             Nothing -> case fromException exc of
@@ -382,8 +384,8 @@ mapEnv :: (b -> a) -> Fx a err res -> Fx b err res
 mapEnv fn (Fx m) =
   Fx $
     ReaderT $
-      \(FxEnv unmask crash live env) ->
-        runReaderT m (FxEnv unmask crash live (fn env))
+      \(FxEnv runIO unmask crash live env) ->
+        runReaderT m (FxEnv runIO unmask crash live (fn env))
 
 -- * Classes
 
