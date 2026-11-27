@@ -148,10 +148,13 @@ scoping (Scope (Fx acquire)) (Fx fx) =
 withCleanupPhase :: (forall a. IO a -> IO a) -> TVar [(ThreadId, ThreadPhase)] -> IO a -> IO a
 withCleanupPhase unmask liveThreads action = do
   claimed <- enterCleanup liveThreads
-  when claimed (absorbClaim unmask liveThreads)
-  result <- action `finally` exitCleanup liveThreads
-  when claimed (throwIO ThreadKilled)
-  pure result
+  let runAction = action `finally` exitCleanup liveThreads
+  if claimed
+    then do
+      absorbClaim unmask liveThreads `onException` void runAction
+      _ <- runAction
+      throwIO ThreadKilled
+    else runAction
 
 closeEnv :: env -> Fx env err res -> Fx env' err res
 closeEnv env (Fx fx) =

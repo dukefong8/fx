@@ -6,6 +6,8 @@ module Fx.Fx
     FxException (..),
     FxExceptionReason (..),
     ThreadPhase (..),
+    ClaimState (..),
+    initialThreadPhase,
     enterCleanup,
     exitCleanup,
     absorbClaim,
@@ -38,21 +40,28 @@ import GHC.Stack (CallStack, HasCallStack, callStack, prettyCallStack)
 -- * Helper types and instances
 
 -- |
+-- Abandonment claim state for a thread of the current run.
+data ClaimState
+  = Unclaimed
+  | -- | The sweep claimed the thread and is sending a kill.
+    Claimed
+  | -- | The claimed kill was delivered.
+    Delivered
+  deriving stock (Eq, Show)
+
+-- |
 -- Lifecycle phase of a thread of the current run.
 --
--- The sweep claims a thread before sending its kill, and records delivery
--- after. A thread that enters cleanup after a claim waits for delivery and
--- absorbs the kill before running its release, so no kill can land inside
--- the release.
-data ThreadPhase
-  = BodyPhase
-  | -- | The sweep claimed the thread and is sending a kill.
-    ClaimedPhase
-  | -- | The thread is running releases. The count is the nesting depth.
-    CleanupPhase !Int
-  | -- | The claimed kill was delivered. The thread is unwinding.
-    DeliveredPhase
+-- Cleanup nesting depth and abandonment claim state are tracked separately
+-- so recording kill delivery never clobbers the active cleanup depth.
+data ThreadPhase = ThreadPhase
+  { cleanupDepth :: !Int,
+    claimState :: !ClaimState
+  }
   deriving stock (Eq, Show)
+
+initialThreadPhase :: ThreadPhase
+initialThreadPhase = ThreadPhase 0 Unclaimed
 
 -- |
 -- Runtime and application environment.
@@ -63,8 +72,8 @@ data FxEnv env
       -- | Crash.
       (CallStack -> [ThreadId] -> FxExceptionReason -> IO ())
       -- | Threads forked by the current run with their lifecycle phase.
-      -- 'abandonRun' claims a thread by moving it out of 'BodyPhase' before
-      -- sending a kill, and marks delivery once the kill is delivered.
+      -- 'abandonRun' claims a thread when its cleanup depth is zero before
+      -- sending a kill, and records delivery afterward.
       (TVar [(ThreadId, ThreadPhase)])
       -- | User environment.
       env
@@ -201,7 +210,7 @@ runFxInIO (Fx m) = uninterruptibleMask $ \unmask -> do
   -- Registered by this thread under the entry mask before releasing the
   -- worker, so the worker cannot enter cleanup before registration and the
   -- sweep cannot miss it between fork and its first instruction.
-  atomically (modifyTVar' liveThreads ((workerTid, BodyPhase) :))
+  atomically (modifyTVar' liveThreads ((workerTid, initialThreadPhase) :))
   putMVar workerReady ()
 
   -- Wait for fatal error or result
@@ -249,41 +258,37 @@ abandonRun liveThreads = uninterruptibleMask_ $ do
     claimed <- atomically $ do
       entries <- readTVar liveThreads
       case lookup tid entries of
-        Just BodyPhase -> do
-          writeTVar liveThreads (setPhase tid ClaimedPhase entries)
+        Just (ThreadPhase 0 Unclaimed) -> do
+          writeTVar liveThreads (updatePhase tid (\p -> p {claimState = Claimed}) entries)
           pure True
         _ -> pure False
     when claimed $ do
       killThread tid `catch` \(_ :: SomeException) -> pure ()
-      atomically (modifyTVar' liveThreads (setPhase tid DeliveredPhase))
+      atomically (modifyTVar' liveThreads (updatePhase tid (\p -> p {claimState = Delivered})))
 
-setPhase :: ThreadId -> ThreadPhase -> [(ThreadId, ThreadPhase)] -> [(ThreadId, ThreadPhase)]
-setPhase tid phase =
-  map (\(t, p) -> if t == tid then (t, phase) else (t, p))
+updatePhase :: ThreadId -> (ThreadPhase -> ThreadPhase) -> [(ThreadId, ThreadPhase)] -> [(ThreadId, ThreadPhase)]
+updatePhase tid f = go
+  where
+    go [] = []
+    go (entry@(t, p) : xs)
+      | t == tid = let !p' = f p in (t, p') : xs
+      | otherwise = let !xs' = go xs in entry : xs'
 
 -- |
 -- Enter the cleanup phase for the current thread.
 --
 -- Returns 'True' when an abandon claim was already committed for this
--- thread. The caller must then absorb the kill before running its release.
+-- thread at cleanup entry. The caller must then absorb the kill before
+-- running its release.
 enterCleanup :: TVar [(ThreadId, ThreadPhase)] -> IO Bool
 enterCleanup liveThreads = do
   tid <- myThreadId
   atomically do
     entries <- readTVar liveThreads
     case lookup tid entries of
-      Just BodyPhase -> do
-        writeTVar liveThreads (setPhase tid (CleanupPhase 1) entries)
-        pure False
-      Just ClaimedPhase -> do
-        writeTVar liveThreads (setPhase tid (CleanupPhase 1) entries)
-        pure True
-      Just (CleanupPhase n) -> do
-        writeTVar liveThreads (setPhase tid (CleanupPhase (n + 1)) entries)
-        pure False
-      Just DeliveredPhase -> do
-        writeTVar liveThreads (setPhase tid (CleanupPhase 1) entries)
-        pure False
+      Just (ThreadPhase depth claim) -> do
+        writeTVar liveThreads (updatePhase tid (\p -> p {cleanupDepth = depth + 1}) entries)
+        pure (depth == 0 && claim == Claimed)
       Nothing -> pure False
 
 -- |
@@ -291,21 +296,14 @@ enterCleanup liveThreads = do
 exitCleanup :: TVar [(ThreadId, ThreadPhase)] -> IO ()
 exitCleanup liveThreads = do
   tid <- myThreadId
-  atomically do
-    entries <- readTVar liveThreads
-    case lookup tid entries of
-      Just (CleanupPhase 1) ->
-        writeTVar liveThreads (setPhase tid BodyPhase entries)
-      Just (CleanupPhase n) ->
-        writeTVar liveThreads (setPhase tid (CleanupPhase (n - 1)) entries)
-      _ -> pure ()
+  atomically (modifyTVar' liveThreads (updatePhase tid (\p -> p {cleanupDepth = max 0 (cleanupDepth p - 1)})))
 
 -- |
 -- Wait for the claimed kill and swallow it, so the following release runs
 -- without an asynchronous exception pending.
 --
 -- The wait runs unmasked: the kill is delivered by the sweep's 'killThread',
--- which blocks until delivery, and the sweep then records 'DeliveredPhase'.
+-- which blocks until delivery, and the sweep then records 'Delivered'.
 absorbClaim :: (forall a. IO a -> IO a) -> TVar [(ThreadId, ThreadPhase)] -> IO ()
 absorbClaim unmask liveThreads = do
   tid <- myThreadId
@@ -314,7 +312,7 @@ absorbClaim unmask liveThreads = do
         atomically do
           entries <- readTVar liveThreads
           case lookup tid entries of
-            Just DeliveredPhase -> pure ()
+            Just (ThreadPhase _ Delivered) -> pure ()
             Nothing -> pure ()
             _ -> retry
     )

@@ -125,7 +125,7 @@ async (Fx m) =
       -- Registered before releasing `childReady` so the child never runs
       -- ahead of registration. A concurrent abandon snapshot from the waiter
       -- can still land between fork and register and miss the child.
-      atomically (modifyTVar' live ((tid, BodyPhase) :))
+      atomically (modifyTVar' live ((tid, initialThreadPhase) :))
       putMVar childReady ()
       pure tid
 
