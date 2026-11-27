@@ -181,11 +181,13 @@ absorbClaimDeferring unmask liveThreads deferred = do
 -- Deliver and defer asynchronous exceptions that are already queued behind
 -- the claimed kill.
 --
--- 'unmask (pure ())' is 'allowInterrupt': it lets the next pending
--- asynchronous exception in, and returns immediately when there is none.
+-- Unmasking at an interruptible operation lets the next pending asynchronous
+-- exception in and returns immediately when there is none. Using
+-- 'threadDelay' rather than a bare 'pure' also delivers when the ambient
+-- state is 'MaskedInterruptible'.
 drainPending :: (forall a. IO a -> IO a) -> Maybe SomeException -> IO (Maybe SomeException)
 drainPending unmask deferred = do
-  outcome <- try (unmask (pure ())) :: IO (Either SomeException ())
+  outcome <- try (unmask (threadDelay 0)) :: IO (Either SomeException ())
   case outcome of
     Right () -> pure deferred
     Left exc ->
