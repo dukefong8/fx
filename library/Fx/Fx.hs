@@ -52,6 +52,7 @@ data FxException = FxException [ThreadId] FxExceptionReason CallStack
 -- Reason of a fatal failure of an `Fx` application.
 data FxExceptionReason
   = UncaughtExceptionFxExceptionReason SomeException
+  | AsyncFxExceptionReason SomeAsyncException
   | ErrorCallFxExceptionReason ErrorCall
   | BugFxExceptionReason String
 
@@ -64,6 +65,7 @@ instance Exception FxException
 instance Show FxExceptionReason where
   show = \case
     UncaughtExceptionFxExceptionReason exc -> Strings.uncaughtException exc
+    AsyncFxExceptionReason asyncExc -> Strings.asyncException asyncExc
     ErrorCallFxExceptionReason errorCall -> show errorCall
     BugFxExceptionReason details -> Strings.bug details
 
@@ -93,7 +95,11 @@ instance MonadFail (Fx env err) where
         fail "Crashed"
 
 instance MonadIO (Fx env SomeException) where
-  liftIO io = Fx (ReaderT (\(FxEnv unmask _ _) -> ExceptT (try (unmask io))))
+  liftIO io = Fx $ ReaderT $ \(FxEnv unmask _ _) -> ExceptT $
+    (Right <$> unmask io) `catch` \(e :: SomeException) ->
+      case fromException e of
+        Just (SomeAsyncException _) -> throwIO e
+        Nothing                     -> pure (Left e)
 
 instance MonadError err (Fx env err) where
   throwError err = Fx (lift (throwE err))
@@ -147,11 +153,18 @@ runFxInIO (Fx m) = uninterruptibleMask $ \unmask -> do
                       )
                       (\errorCall -> crash callStack [] (ErrorCallFxExceptionReason errorCall))
             )
-            ( \exc -> return $ case fromException exc of
-                -- Catch calls to `error`.
-                Just errorCall -> crash callStack [] (ErrorCallFxExceptionReason errorCall)
-                -- Catch anything else we could miss. Just in case.
-                _ -> crash callStack [] (BugFxExceptionReason (Strings.unexpectedException exc))
+            ( \exc -> return $
+                case fromException exc of
+                  -- An asynchronous exception that reached the worker, e.g. a
+                  -- kill during unmasked user IO. It is posted as a fatal failure
+                  -- with its own reason rather than `Bug`. The channel post
+                  -- (not a rethrow) is what wakes the waiter, so this stays a `crash`.
+                  Just (asyncExc :: SomeAsyncException) -> crash callStack [] (AsyncFxExceptionReason asyncExc)
+                  Nothing -> case fromException exc of
+                    -- Catch calls to `error`.
+                    Just (errorCall :: ErrorCall) -> crash callStack [] (ErrorCallFxExceptionReason errorCall)
+                    -- Anything else is a defect we could miss.
+                    Nothing -> crash callStack [] (BugFxExceptionReason (Strings.unexpectedException exc))
             )
 
     -- Throw errors or post the result
@@ -180,8 +193,11 @@ runFxInIO (Fx m) = uninterruptibleMask $ \unmask -> do
 -- |
 -- Turn a non-failing IO action into an effect.
 --
+-- Asynchronous exceptions are rethrown rather than turned into a fatal
+-- failure, so cancellation stays effective.
+--
 -- __Warning:__
--- It is your responsibility to ensure that it does not throw exceptions!
+-- It is your responsibility to ensure that it does not throw synchronous exceptions!
 runTotalIO :: (env -> IO res) -> Fx env err res
 runTotalIO io = Fx $
   ReaderT $
@@ -190,8 +206,11 @@ runTotalIO io = Fx $
         catch
           (unmask (io env))
           ( \(exc :: SomeException) -> do
-              crash callStack [] (UncaughtExceptionFxExceptionReason exc)
-              fail "Unhandled exception in runTotalIO. Got propagated to top."
+              case fromException exc of
+                Just (asyncExc :: SomeAsyncException) -> throwIO asyncExc
+                Nothing -> do
+                  crash callStack [] (UncaughtExceptionFxExceptionReason exc)
+                  fail "Unhandled exception in runTotalIO. Got propagated to top."
           )
 
 -- |
@@ -205,6 +224,9 @@ runPartialIO io = runTotalIO io >>= either throwErr return
 -- |
 -- Run IO which only throws a specific type of exception.
 --
+-- Asynchronous exceptions are rethrown rather than turned into a fatal
+-- failure, so cancellation stays effective.
+--
 -- __Warning:__
 -- It is your responsibility to ensure that it doesn't throw any other exceptions!
 runExceptionalIO :: (Exception exc) => (env -> IO res) -> Fx env exc res
@@ -215,9 +237,11 @@ runExceptionalIO io =
         catch (fmap Right (unmask (io env))) $
           \exc -> case fromException exc of
             Just exc' -> return (Left exc')
-            Nothing -> do
-              crash callStack [] (UncaughtExceptionFxExceptionReason exc)
-              fail "Unhandled exception in runExceptionalIO. Got propagated to top."
+            Nothing -> case fromException exc of
+              Just (asyncExc :: SomeAsyncException) -> throwIO asyncExc
+              Nothing -> do
+                crash callStack [] (UncaughtExceptionFxExceptionReason exc)
+                fail "Unhandled exception in runExceptionalIO. Got propagated to top."
 
 -- |
 -- Map the environment.

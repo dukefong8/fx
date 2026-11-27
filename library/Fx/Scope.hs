@@ -24,18 +24,46 @@ instance Functor (Scope err) where
 
 instance Applicative (Scope err) where
   pure env = Scope (pure (env, pure ()))
-  Scope m1 <*> Scope m2 =
-    Scope $
-      liftA2 (\(env1, release1) (env2, release2) -> (env1 env2, release2 *> release1)) m1 m2
+  -- Composition is sequential with LIFO release, which is exactly
+  -- what the 'Monad' instance expresses, so reuse it instead of
+  -- duplicating the rollback logic.
+  (<*>) = ap
 
 instance Monad (Scope err) where
   return = pure
-  Scope m >>= f =
-    Scope do
-      (env, release) <- m
-      let Scope m2 = f env
-      (env2, release2) <- m2
-      return (env2, release2 *> release)
+  Scope (Fx m1) >>= f =
+    Scope $ Fx $ ReaderT $ \(FxEnv unmask crash ()) -> ExceptT $ do
+      r1 <- runExceptT (runReaderT m1 (FxEnv unmask crash ()))
+      case r1 of
+        Left e -> pure (Left e)
+        -- Teardown dispatch is pinned so it does not depend on the ambient mask.
+        Right (env, Fx rel1) -> uninterruptibleMask_ $ do
+          let runRel1 = void (runExceptT (runReaderT rel1 (FxEnv unmask crash ())))
+          r2 <- (do
+            Scope (Fx m2) <- evaluate (f env)
+            runExceptT (runReaderT m2 (FxEnv unmask crash ()))
+            ) `onException` runRel1
+          case r2 of
+            Left e2 -> runRel1 >> pure (Left e2)
+            Right (env2, Fx rel2) -> pure (Right (env2, andReleases (Fx rel2) (Fx rel1)))
+
+-- |
+-- Run two releases, attempting the second even if the first fails.
+-- The first error wins. Thrown exceptions follow 'finally' semantics:
+-- the second still runs, and a throw from the second replaces the first.
+andReleases :: Fx () err () -> Fx () err () -> Fx () err ()
+andReleases (Fx later) (Fx earlier) =
+  Fx $ ReaderT $ \(FxEnv unmask crash ()) -> ExceptT $
+    uninterruptibleMask_ $ do
+      firstResult <-
+        runExceptT (runReaderT later (FxEnv unmask crash ()))
+          `onException` void (runExceptT (runReaderT earlier (FxEnv unmask crash ())))
+      case firstResult of
+        Left firstError -> do
+          _ <- runExceptT (runReaderT earlier (FxEnv unmask crash ()))
+          pure (Left firstError)
+        Right () ->
+          runExceptT (runReaderT earlier (FxEnv unmask crash ()))
 
 instance Bifunctor Scope where
   bimap lf rf (Scope m) = Scope (bimap lf (bimap rf (first lf)) m)
@@ -80,7 +108,7 @@ acquire acquireFx = Scope do
 releasing :: Fx env err () -> Scope err env -> Scope err env
 releasing release (Scope m) = Scope $ do
   (env, existingRelease) <- m
-  return (env, existingRelease >> closeEnv env release)
+  return (env, andReleases existingRelease (closeEnv env release))
 
 -- |
 -- Schedule an action to be run after the scope is exited.
@@ -94,14 +122,18 @@ scoping :: Scope err env -> Fx env err res -> Fx env' err res
 scoping (Scope (Fx acquire)) (Fx fx) =
   Fx $
     ReaderT $
-      \(FxEnv unmask crash _) -> ExceptT $ do
+      \(FxEnv unmask crash _) -> ExceptT $ uninterruptibleMask_ $ do
         let providerFxEnv = FxEnv unmask crash ()
         acquisition <- runExceptT (runReaderT acquire providerFxEnv)
         case acquisition of
           Left err -> return (Left err)
+          -- Everything from acquisition on stays inside 'uninterruptibleMask_'
+          -- so a cancel cannot skip cleanup between acquisition, the body and
+          -- the release. Release leaves still unmask via 'unmask' by design.
           Right (env, (Fx release)) -> do
-            resOrErr <- runExceptT (runReaderT fx (FxEnv unmask crash env))
-            releasing <- runExceptT (runReaderT release providerFxEnv)
+            let runRelease = runExceptT (runReaderT release providerFxEnv)
+            resOrErr <- runExceptT (runReaderT fx (FxEnv unmask crash env)) `onException` runRelease
+            releasing <- runRelease
             return (resOrErr <* releasing)
 
 closeEnv :: env -> Fx env err res -> Fx env' err res

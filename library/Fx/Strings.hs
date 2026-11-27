@@ -18,6 +18,10 @@ uncaughtException :: SomeException -> String
 uncaughtException exc =
   showString "Uncaught exception: " (show exc)
 
+asyncException :: SomeAsyncException -> String
+asyncException exc =
+  showString "Asynchronous exception: " (show exc)
+
 fatalErrorAtThreadPath :: [ThreadId] -> String -> String
 fatalErrorAtThreadPath =
   let showTids = intercalate "/" . fmap (drop 9 . show)

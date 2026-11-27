@@ -115,4 +115,5 @@ test-suite test
   build-depends:
     fx,
     hspec >=2.11 && <3,
+    monad-parallel,
     rerebase <2,

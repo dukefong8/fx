@@ -97,3 +97,5 @@ The design of `fx` draws inspiration from several sources:
 - **UIO**: The approach to lifting `IO` actions with explicit error handling in `fx` is influenced by the ideas presented in the [`unexceptionalio`](https://hackage.haskell.org/package/unexceptionalio) library, promoting safer interaction with `IO` while avoiding unchecked exceptions.
 
 - **ZIO**: Although initially conceived at the same time as the [`ZIO`](http://zio.dev) library for Scala, `fx` does intersect in core ideas and due to the popularity of ZIO it takes its experience and evolution into account.
+
+- **Exception Best Practices** ([Well-Typed, 2026](https://www.well-typed.com/blog/2026/11/exception-best-practices/)): Background on async exceptions, masking, `bracket`, and thread cancellation relevant to reasoning about `Fx`'s `unmask`/`crash` and `Scope`.

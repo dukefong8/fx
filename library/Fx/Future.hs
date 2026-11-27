@@ -73,6 +73,21 @@ async (Fx m) =
 
       let childCrash stack tids dls = crash stack (tid : tids) dls
 
+          -- Only `ThreadKilled` goes to the outer handler, which ends
+          -- the future empty without a fatal failure. Any other
+          -- asynchronous exception is posted as a fatal failure here,
+          -- so an awaiter sees it instead of an uncaught exception
+          -- leaving the future unfilled.
+          handle exc
+            | Just ThreadKilled <- fromException exc =
+                throwIO exc
+            | Just (asyncExc :: SomeAsyncException) <- fromException exc =
+                childCrash callStack [] (AsyncFxExceptionReason asyncExc)
+            | Just errorCall <- fromException exc =
+                childCrash callStack [] (ErrorCallFxExceptionReason errorCall)
+            | otherwise =
+                childCrash callStack [] (BugFxExceptionReason (Strings.unexpectedException exc))
+
       finalize <-
         catch
           ( do
@@ -80,11 +95,7 @@ async (Fx m) =
               return (atomically (putTMVar futureVar (first Just res)))
           )
           ( \exc -> return $ do
-              case fromException exc of
-                -- Catch calls to `error`.
-                Just errorCall -> crash callStack [] (ErrorCallFxExceptionReason errorCall)
-                -- Catch anything else we could miss. Just in case.
-                _ -> crash callStack [] (BugFxExceptionReason (Strings.unexpectedException exc))
+              handle exc
               atomically (putTMVar futureVar (Left Nothing))
           )
 
