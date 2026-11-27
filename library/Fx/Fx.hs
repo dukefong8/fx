@@ -218,14 +218,14 @@ runFxInIO (Fx m) = uninterruptibleMask $ \unmask -> do
                   return $ return res
               ]
       )
-      ( \(exc :: SomeException) ->
+      ( \(exc :: SomeException) -> do
+          -- The waiter was abandoned from outside or failed unexpectedly.
+          -- Kill the worker's threads before leaving so none outlive the run.
+          abandonRun liveThreads
           case fromException exc of
-            -- The waiter was abandoned from outside. Kill the worker's threads
-            -- before leaving so no thread outlives this run.
-            Just (asyncExc :: AsyncException) -> do
-              abandonRun liveThreads
-              throwIO asyncExc
-            _ ->
+            Just (_ :: SomeAsyncException) ->
+              throwIO exc
+            Nothing ->
               throwIO (FxException [] (BugFxExceptionReason (Strings.failedWaitingForFinalResult exc)) callStack)
       )
 

@@ -366,6 +366,27 @@ main = hspec do
     finished <- pollUntil 2000000 (readIORef finishedRef)
     finished `shouldBe` True
 
+  it "Custom async on the waiter abandons the run and rethrows" do
+    ticksRef <- newIORef (0 :: Int)
+    startedVar <- newEmptyMVar
+    resVar <- newEmptyMVar
+    let body :: Fx () Void ()
+        body = do
+          runTotalIO (\_ -> putMVar startedVar ())
+          runTotalIO $ \_ -> forever (threadDelay 10000 >> modifyIORef' ticksRef (+ 1))
+    runner <- forkIO (try @ReviewAsyncException (runFx body) >>= putMVar resVar)
+    takeMVar startedVar
+    throwTo runner (ReviewAsyncException "cancel")
+    res <- takeMVar resVar
+    case res of
+      Left (ReviewAsyncException "cancel") -> return ()
+      Right () -> expectationFailure "Expected ReviewAsyncException"
+      Left exc -> expectationFailure ("Unexpected exception: " ++ show exc)
+    firstSample <- readIORef ticksRef
+    threadDelay 150000
+    secondSample <- readIORef ticksRef
+    secondSample `shouldBe` firstSample
+
   it "Custom async in a future child surfaces with the async reason" do
     -- A non-ThreadKilled asynchronous exception must still fill the future,
     -- or an awaiter would see an STM-blocked bug instead of the child failure.
