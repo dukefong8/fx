@@ -335,6 +335,46 @@ main = hspec do
     released <- pollUntil 2000000 (readIORef releasedRef)
     released `shouldBe` True
 
+  it "Abandoned run absorbs a queued async exception ahead of the claimed kill" do
+    startedVar <- newEmptyMVar
+    helperGo <- newEmptyMVar
+    gateVar <- newEmptyMVar
+    finishedRef <- newIORef False
+    workerTidRef <- newIORef Nothing
+    let scope :: Scope Void ()
+        scope = do
+          _ <- acquire (pure () :: Fx () Void ())
+          _ <- registerRelease ((runTotalIO $ \_ -> do
+            threadDelay 100000
+            writeIORef finishedRef True) :: Fx () Void ())
+          pure ()
+        body :: Fx () Void ()
+        body = do
+          runTotalIO $ \_ -> do
+            tid <- myThreadId
+            writeIORef workerTidRef (Just tid)
+            putMVar startedVar ()
+          -- Hold the body in the masking state it inherited from 'scoping',
+          -- so both queued exceptions stay pending until cleanup.
+          maskedIO_ (takeMVar gateVar)
+    runner <- forkIO (runFx (scoping scope body) >> pure ())
+    takeMVar startedVar
+    Just workerTid <- readIORef workerTidRef
+    -- 'throwTo' blocks until delivery, so queue the first exception from a
+    -- helper thread and let it park while the worker is masked.
+    _ <- forkIO $ do
+      putMVar helperGo ()
+      throwTo workerTid (ReviewAsyncException "queued-ahead")
+    takeMVar helperGo
+    threadDelay 200000
+    killThread runner
+    -- Let the sweep claim the worker and queue its kill behind the first
+    -- asynchronous exception.
+    threadDelay 50000
+    putMVar gateVar ()
+    finished <- pollUntil 2000000 (readIORef finishedRef)
+    finished `shouldBe` True
+
   it "Abandoned run keeps a nested release protected" do
     tailStartedVar <- newEmptyMVar
     tailGateVar <- newEmptyMVar
@@ -418,6 +458,14 @@ pollUntil micros check
       if ok
         then return True
         else threadDelay 10000 >> pollUntil (micros - 10000) check
+
+-- |
+-- Run IO in the current masking state instead of restoring the ambient
+-- unmasking policy. Test-only helper for holding a worker in a masked body
+-- so queued asynchronous exceptions stay pending until cleanup.
+{-# NOINLINE maskedIO_ #-}
+maskedIO_ :: IO () -> Fx env err ()
+maskedIO_ io = unsafePerformIO io `seq` pure ()
 
 testException :: Fx () Void a -> (FxException -> Bool) -> IO ()
 testException fx validateExc = do

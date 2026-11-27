@@ -151,10 +151,43 @@ withCleanupPhase unmask liveThreads action = do
   let runAction = action `finally` exitCleanup liveThreads
   if claimed
     then do
-      absorbClaim unmask liveThreads `onException` void runAction
+      deferred <- absorbClaimDeferring unmask liveThreads Nothing
       _ <- runAction
-      throwIO ThreadKilled
+      case deferred of
+        Just exc -> throwIO exc
+        Nothing -> throwIO ThreadKilled
     else runAction
+
+-- |
+-- Absorb the claimed kill, deferring other asynchronous exceptions.
+--
+-- Another asynchronous exception can already be queued around the claimed
+-- kill. Catching one and running the release immediately would leave the
+-- others pending, so one could fire inside the release. Keep waiting until
+-- the claimed kill is delivered, then drain the rest, then let the caller
+-- run the release and rethrow the first deferred exception afterwards.
+absorbClaimDeferring :: (forall a. IO a -> IO a) -> TVar [(ThreadId, ThreadPhase)] -> Maybe SomeException -> IO (Maybe SomeException)
+absorbClaimDeferring unmask liveThreads deferred = do
+  outcome <- try (absorbClaim unmask liveThreads) :: IO (Either SomeException ())
+  case outcome of
+    Right () -> drainPending unmask deferred
+    Left exc -> absorbClaimDeferring unmask liveThreads (deferred <|> Just exc)
+
+-- |
+-- Deliver and defer asynchronous exceptions that are already queued behind
+-- the claimed kill.
+--
+-- 'unmask (pure ())' is 'allowInterrupt': it lets the next pending
+-- asynchronous exception in, and returns immediately when there is none.
+drainPending :: (forall a. IO a -> IO a) -> Maybe SomeException -> IO (Maybe SomeException)
+drainPending unmask deferred = do
+  outcome <- try (unmask (pure ())) :: IO (Either SomeException ())
+  case outcome of
+    Right () -> pure deferred
+    Left exc ->
+      case fromException exc of
+        Just ThreadKilled -> drainPending unmask deferred
+        Nothing -> drainPending unmask (deferred <|> Just exc)
 
 closeEnv :: env -> Fx env err res -> Fx env' err res
 closeEnv env (Fx fx) =
