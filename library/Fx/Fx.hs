@@ -238,12 +238,13 @@ runFxInIO (Fx m) = uninterruptibleMask $ \unmask -> do
 -- sweep waits for delivery and absorbs the kill before its release runs, so
 -- no kill can land inside the release.
 --
--- Each kill is delivered before the next one is issued, so a thread blocked
--- in an uninterruptible foreign call delays the remaining kills. That is the
--- same best-effort delivery `cancel` already relies on.
+-- Threads are claimed oldest-first (worker before children) so the worker
+-- stops spawning new work before existing children are killed. Each kill
+-- blocks until delivered, so a thread stuck in an uninterruptible foreign
+-- call or mask blocks both abandonment return and the remaining kills.
 abandonRun :: TVar [(ThreadId, ThreadPhase)] -> IO ()
 abandonRun liveThreads = uninterruptibleMask_ $ do
-  tids <- map fst <$> atomically (readTVar liveThreads)
+  tids <- reverse . map fst <$> atomically (readTVar liveThreads)
   forM_ tids \tid -> do
     claimed <- atomically $ do
       entries <- readTVar liveThreads
