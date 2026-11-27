@@ -68,14 +68,14 @@ async (Fx m) =
     let handler = \case
           ThreadKilled -> do
             self <- myThreadId
-            atomically (modifyTVar' live (filter (/= self)))
+            atomically (modifyTVar' live (filter ((/= self) . fst)))
             void $ atomically (tryPutTMVar futureVar (Left Nothing))
           exc -> throwIO exc
     tid <- forkIO $ handle handler do
       tid <- myThreadId
 
       let childCrash stack tids dls = crash stack (tid : tids) dls
-          unregister = atomically (modifyTVar' live (filter (/= tid)))
+          unregister = atomically (modifyTVar' live (filter ((/= tid) . fst)))
 
           -- Only `ThreadKilled` goes to the outer handler, which ends
           -- the future empty without a fatal failure. Any other
@@ -92,9 +92,10 @@ async (Fx m) =
             | otherwise =
                 childCrash callStack [] (BugFxExceptionReason (Strings.unexpectedException exc))
 
-      -- Unregistered on the way out of either outcome. The child is registered
-      -- by its parent before this runs, so the run's kill sweep can never miss
-      -- it between fork and its first instruction.
+      -- Unregistered on the way out of either outcome. The parent registers
+      -- the child before this runs, which narrows but does not close the
+      -- fork-to-register window: a concurrent abandon snapshot can land
+      -- between them and miss the child. Best-effort only.
       finalize <-
         catch
           ( do
@@ -111,9 +112,11 @@ async (Fx m) =
 
       finalize
 
-    -- Registered by the spawning thread, which holds the run's mask, so the
-    -- kill sweep can never miss the child between fork and its first instruction.
-    atomically (modifyTVar' live (tid :))
+    -- Registered by the spawning thread while masked. The mask only orders
+    -- this thread's own fork-then-register steps; a concurrent abandon
+    -- snapshot from the waiter can still land between them and miss the
+    -- child. Best-effort only.
+    atomically (modifyTVar' live ((tid, True) :))
 
     return $ Future (Just tid) $ Compose $ readTMVar futureVar
 

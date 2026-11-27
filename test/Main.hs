@@ -263,6 +263,53 @@ main = hspec do
     secondSample <- readIORef ticksRef
     firstSample `shouldBe` secondSample
 
+  it "Abandoned run lets an in-flight release finish" do
+    startedRef <- newIORef False
+    finishedRef <- newIORef False
+    let scope :: Scope Void ()
+        scope = do
+          _ <- acquire (pure () :: Fx () Void ())
+          _ <- registerRelease ((runTotalIO $ \_ -> do
+            writeIORef startedRef True
+            threadDelay 300000
+            writeIORef finishedRef True) :: Fx () Void ())
+          pure ()
+        body :: Fx () Void ()
+        body = pure ()
+    runner <- forkIO (runFx (scoping scope body) >> pure ())
+    started <- pollUntil 2000000 (readIORef startedRef)
+    started `shouldBe` True
+    killThread runner
+    finished <- pollUntil 2000000 (readIORef finishedRef)
+    finished `shouldBe` True
+
+  it "Abandoned run lets an acquisition-rollback release finish" do
+    startedRef <- newIORef False
+    finishedRef <- newIORef False
+    let first :: Scope String Int
+        first = do
+          a <- acquire (pure 1 :: Fx () String Int)
+          _ <- registerRelease ((runTotalIO $ \_ -> do
+            writeIORef startedRef True
+            threadDelay 300000
+            writeIORef finishedRef True) :: Fx () String ())
+          pure a
+        failing :: Scope String Int
+        failing = acquire (throwErr "boom" :: Fx () String Int)
+        chained :: Scope String (Int, Int)
+        chained = do
+          a <- first
+          b <- failing
+          pure (a, b)
+        body :: Fx (Int, Int) String ()
+        body = pure ()
+    runner <- forkIO (runFx (exposeErr (scoping chained body) :: Fx () Void (Either String ())) >> pure ())
+    started <- pollUntil 2000000 (readIORef startedRef)
+    started `shouldBe` True
+    killThread runner
+    finished <- pollUntil 2000000 (readIORef finishedRef)
+    finished `shouldBe` True
+
   it "Custom async in a future child surfaces with the async reason" do
     -- A non-ThreadKilled asynchronous exception must still fill the future,
     -- or an awaiter would see an STM-blocked bug instead of the child failure.

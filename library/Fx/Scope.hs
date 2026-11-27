@@ -38,7 +38,9 @@ instance Monad (Scope err) where
         Left e -> pure (Left e)
         -- Teardown dispatch is pinned so it does not depend on the ambient mask.
         Right (env, Fx rel1) -> uninterruptibleMask_ $ do
-          let runRel1 = void (runExceptT (runReaderT rel1 (FxEnv unmask crash live ())))
+          let runRel1 =
+                withCleanupPhase live $
+                  void (runExceptT (runReaderT rel1 (FxEnv unmask crash live ())))
           r2 <- (do
             Scope (Fx m2) <- evaluate (f env)
             runExceptT (runReaderT m2 (FxEnv unmask crash live ()))
@@ -132,9 +134,27 @@ scoping (Scope (Fx acquire)) (Fx fx) =
           -- the release. Release leaves still unmask via 'unmask' by design.
           Right (env, (Fx release)) -> do
             let runRelease = runExceptT (runReaderT release providerFxEnv)
-            resOrErr <- runExceptT (runReaderT fx (FxEnv unmask crash live env)) `onException` runRelease
-            releasing <- runRelease
+            resOrErr <- runExceptT (runReaderT fx (FxEnv unmask crash live env)) `onException` withCleanupPhase live runRelease
+            releasing <- withCleanupPhase live runRelease
             return (resOrErr <* releasing)
+
+-- Run an action with the current thread flagged as in cleanup.
+-- An abandon snapshot taken during the action skips this thread, so a
+-- release usually completes; snapshot-then-kill stays best-effort.
+-- Plain enter/exit: exit always re-arms the flag, even when nested.
+-- A thread with no entry is left alone.
+withCleanupPhase :: TVar [(ThreadId, Bool)] -> IO a -> IO a
+withCleanupPhase liveThreads = bracket_ enter exit
+  where
+    enter = setPhase False
+    exit = setPhase True
+    setPhase active = do
+      tid <- myThreadId
+      atomically
+        ( modifyTVar'
+            liveThreads
+            (map (\entry@(t, _) -> if t == tid then (t, active) else entry))
+        )
 
 closeEnv :: env -> Fx env err res -> Fx env' err res
 closeEnv env (Fx fx) =

@@ -41,8 +41,14 @@ data FxEnv env
       (forall a. IO a -> IO a)
       -- | Crash.
       (CallStack -> [ThreadId] -> FxExceptionReason -> IO ())
-      -- | Threads forked by the current run.
-      (TVar [ThreadId])
+      -- | Threads forked by the current run. Each entry holds one thread
+      -- and a flag that says whether its body is still active.
+      -- 'abandonRun' kills only the entries that are still flagged active
+      -- in its snapshot. A thread that already entered cleanup is spared,
+      -- so a release that has started normally finishes. The snapshot and
+      -- the kills are two separate steps, and a phase change can land
+      -- between them. The protection is therefore best-effort, not atomic.
+      (TVar [(ThreadId, Bool)])
       -- | User environment.
       env
 
@@ -174,8 +180,10 @@ runFxInIO (Fx m) = uninterruptibleMask $ \unmask -> do
     finalize
 
   -- Registered by this thread, under the entry mask, so the kill sweep can
-  -- never miss the worker between fork and its first instruction.
-  atomically (modifyTVar' liveThreads (workerTid :))
+  -- never miss the worker between fork and its first instruction: the same
+  -- thread registers before it can reach the wait that abandons, and the mask
+  -- keeps those steps ordered.
+  atomically (modifyTVar' liveThreads ((workerTid, True) :))
 
   -- Wait for fatal error or result
   join $
@@ -203,15 +211,19 @@ runFxInIO (Fx m) = uninterruptibleMask $ \unmask -> do
       )
 
 -- |
--- Terminate every thread registered by the current run.
+-- Terminate the threads of an abandoned run whose body is still active.
 --
--- Each kill is delivered before the next one is issued, so a thread that is
--- blocked in an uninterruptible foreign call delays the remaining kills.
--- That is the same best-effort delivery `cancel` already relies on.
-abandonRun :: TVar [ThreadId] -> IO ()
+-- Threads flagged as in cleanup at snapshot time are skipped, so an
+-- in-flight release usually finishes instead of being aborted halfway.
+-- Snapshot-then-kill is best-effort, not atomic: a phase change racing the
+-- snapshot may still be missed.
+-- Each kill is delivered before the next one is issued, so a thread blocked
+-- in an uninterruptible foreign call delays the remaining kills. That is the
+-- same best-effort delivery `cancel` already relies on.
+abandonRun :: TVar [(ThreadId, Bool)] -> IO ()
 abandonRun liveThreads = uninterruptibleMask_ $ do
-  tids <- atomically (readTVar liveThreads)
-  mapM_ (\tid -> killThread tid `catch` \(_ :: SomeException) -> pure ()) tids
+  active <- atomically (filter snd <$> readTVar liveThreads)
+  mapM_ (\(tid, _) -> killThread tid `catch` \(_ :: SomeException) -> pure ()) active
 
 -- |
 -- Turn a non-failing IO action into an effect.
