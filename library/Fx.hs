@@ -14,6 +14,7 @@ module Fx
     -- ** Error handling
     throwErr,
     handleErr,
+    liftErr,
     mapErr,
     exposeErr,
     absorbErr,
@@ -37,6 +38,7 @@ module Fx
     -- * Scope
     Scope,
     acquire,
+    releasing,
     registerRelease,
 
     -- * Exceptions

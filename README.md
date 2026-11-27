@@ -39,11 +39,14 @@ It is particularly useful for applications with:
 ## Quick Start
 
 ```haskell
+import Control.Exception (SomeException)
+import Data.Text (Text)
 import Fx
 
--- Define your environment and error types
+-- Define your environment and error types.
 data Env = Env { dbConn :: Connection, apiKey :: Text }
-data Err = DbError SomeException | ApiError Text
+data Err = ApiError Text | DbError SomeException | IOError SomeException
+  deriving Show
 
 -- Resource acquisition with automatic cleanup
 env :: Scope Err Env
@@ -59,14 +62,17 @@ env = do
 fetchUser :: Int -> Fx Env Err User
 fetchUser userId =
   mapErr DbError $
-    runExceptionalIO $ \Env{dbConn} -> 
-      queryUser dbConn userId
+    runExceptionalIO $ \dbEnv ->
+      queryUser (dbConn dbEnv) userId
 
 -- Compose and run
 main :: IO ()
-main = runFx $ scoping env $ do
-  user <- fetchUser 42
-  liftIO $ print user
+main =
+  runFx $
+    handleErr (\err -> runTotalIO $ \_ -> print err) $
+      scoping env $ do
+        user <- fetchUser 42
+        liftErr IOError $ print user
 ```
 
 ## Philosophy and Use Cases

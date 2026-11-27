@@ -4,7 +4,7 @@ import Control.Monad (forever)
 import Control.Monad.Parallel (bindM2)
 import Fx
 import Test.Hspec
-import Prelude hiding (choose)
+import Prelude hiding (choose, IOError)
 
 main :: IO ()
 main = hspec do
@@ -226,6 +226,18 @@ main = hspec do
   it "liftIO does not swallow an async kill" do
     let action :: Fx () SomeException ()
         action = liftIO $ do
+          self <- myThreadId
+          _ <- forkIO (threadDelay 50000 >> killThread self)
+          threadDelay 5000000
+    res <- try (runFx (absorbErr (const ()) action)) :: IO (Either FxException ())
+    case res of
+      Left (FxException _ (AsyncFxExceptionReason _) _) -> return ()
+      Left exc -> expectationFailure ("Wrong reason: " ++ show exc)
+      Right _ -> expectationFailure "Kill was swallowed as a value"
+
+  it "runExceptionalIO with SomeException rethrows an async kill" do
+    let action :: Fx () SomeException ()
+        action = runExceptionalIO $ \() -> do
           self <- myThreadId
           _ <- forkIO (threadDelay 50000 >> killThread self)
           threadDelay 5000000
@@ -478,12 +490,84 @@ main = hspec do
       Left exc -> expectationFailure ("Wrong reason: " ++ show exc)
       Right _ -> expectationFailure "No exception"
 
+  it "README Quick Start example runs" do
+    user <- runFx $
+      handleErr (\_ -> pure (User "fallback")) $
+        scoping env $ do
+          u <- fetchUser 42
+          liftErr IOError $ print u
+          pure u
+    user `shouldBe` User "User 42"
+
+  it "liftErr rethrows an async kill instead of mapping it" do
+    let action :: Fx () String ()
+        action = liftErr show $ do
+          self <- myThreadId
+          _ <- forkIO (threadDelay 50000 >> killThread self)
+          threadDelay 5000000
+    res <- try (runFx (absorbErr (const ()) action)) :: IO (Either FxException ())
+    case res of
+      Left (FxException _ (AsyncFxExceptionReason _) _) -> return ()
+      Left exc -> expectationFailure ("Wrong reason: " ++ show exc)
+      Right _ -> expectationFailure "Kill was swallowed as a value"
+
+  it "liftErr maps a non-matching sync throw into a catchable Left" do
+    caught <- runFx $ handleErr (\(_ :: String) -> pure "caught") $
+      liftErr show (ioError (userError "boom")) >> pure "after"
+    caught `shouldBe` "caught"
+
+  it "liftErr carries the mapped exception as Left" do
+    res <- try (runFx (exposeErr (liftErr show (ioError (userError "boom"))))) :: IO (Either FxException (Either String ()))
+    case res of
+      Right (Left msg) -> msg `shouldBe` "user error (boom)"
+      Right (Right _) -> expectationFailure "Throw was swallowed as a value"
+      Left exc -> expectationFailure ("Unexpected failure: " ++ show exc)
+
 data ReviewAsyncException = ReviewAsyncException String
   deriving stock (Show, Typeable)
 
 instance Exception ReviewAsyncException where
   toException = asyncExceptionToException
   fromException = asyncExceptionFromException
+
+-- the README example
+
+data Connection = Connection
+
+data User = User String
+  deriving stock (Eq, Show)
+
+data Env = Env {dbConn :: Connection, apiKey :: String}
+
+data Err = ApiError String | DbError SomeException | IOError SomeException
+  deriving stock Show
+
+connectDb :: String -> Fx () Err Connection
+connectDb _ = pure Connection
+
+closeDb :: Fx Connection Err ()
+closeDb = pure ()
+
+readApiKey :: FilePath -> Fx () Err String
+readApiKey _ = pure "key"
+
+queryUser :: Connection -> Int -> IO User
+queryUser _ n = pure (User ("User " ++ show n))
+
+env :: Scope Err Env
+env = do
+  conn <-
+    releasing closeDb $
+      acquire (connectDb "postgres://localhost/mydb")
+  key <-
+    acquire (readApiKey "config.txt")
+  pure $ Env conn key
+
+fetchUser :: Int -> Fx Env Err User
+fetchUser userId =
+  mapErr DbError $
+    runExceptionalIO $ \dbEnv ->
+      queryUser (dbConn dbEnv) userId
 
 pollUntil :: Int -> IO Bool -> IO Bool
 pollUntil micros check

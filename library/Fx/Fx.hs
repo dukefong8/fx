@@ -23,6 +23,7 @@ module Fx.Fx
     throwErr,
     handleErr,
     mapErr,
+    liftErr,
     exposeErr,
     absorbErr,
 
@@ -132,10 +133,10 @@ instance MonadFail (Fx env err) where
 
 instance MonadIO (Fx env SomeException) where
   liftIO io = Fx $ ReaderT $ \(FxEnv runIO _ _ _ _) -> ExceptT $
-    (Right <$> runIO io) `catch` \(e :: SomeException) ->
+    catch (Right <$> runIO io) $ \e ->
       case fromException e of
-        Just (SomeAsyncException _) -> throwIO e
-        Nothing                     -> pure (Left e)
+        Just (asyncExc :: SomeAsyncException) -> throwIO asyncExc
+        Nothing -> pure (Left e)
 
 instance MonadError err (Fx env err) where
   throwError err = Fx (lift (throwE err))
@@ -370,12 +371,20 @@ runExceptionalIO io =
       \(FxEnv runIO _ crash _ env) -> ExceptT $
         catch (fmap Right (runIO (io env))) $
           \exc -> case fromException exc of
-            Just exc' -> return (Left exc')
+            Just (asyncExc :: SomeAsyncException) -> throwIO asyncExc
             Nothing -> case fromException exc of
-              Just (asyncExc :: SomeAsyncException) -> throwIO asyncExc
+              Just exc' -> return (Left exc')
               Nothing -> do
                 crash callStack [] (UncaughtExceptionFxExceptionReason exc)
                 fail "Unhandled exception in runExceptionalIO. Got propagated to top."
+
+-- |
+-- Run IO and map a synchronous exception into a typed error.
+--
+-- Asynchronous exceptions are rethrown rather than turned into a fatal
+-- failure, so cancellation stays effective.
+liftErr :: forall err res env. (SomeException -> err) -> IO res -> Fx env err res
+liftErr f = mapErr f . liftIO
 
 -- |
 -- Map the environment.
