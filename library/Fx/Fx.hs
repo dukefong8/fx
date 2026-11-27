@@ -252,8 +252,12 @@ runFxInIO (Fx m) = uninterruptibleMask $ \unmask -> do
 --
 -- Threads are claimed oldest-first (worker before children) so the worker
 -- stops spawning new work before existing children are killed. Each kill
--- blocks until delivered, so a thread stuck in an uninterruptible foreign
--- call or mask blocks both abandonment return and the remaining kills.
+-- blocks until delivered, so a thread stuck in an uninterruptible mask
+-- blocks both abandonment return and the remaining kills.
+--
+-- A @safe@ foreign call is not interruptible while it runs, so a thread
+-- blocked in one delays abandonment until the call returns. Use an
+-- interruptible foreign call for operations that must be cancellable.
 abandonRun :: TVar [(ThreadId, ThreadPhase)] -> IO ()
 abandonRun liveThreads = uninterruptibleMask_ $ do
   tids <- reverse . map fst <$> atomically (readTVar liveThreads)
