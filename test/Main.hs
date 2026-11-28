@@ -490,6 +490,26 @@ main = hspec do
       Left exc -> expectationFailure ("Wrong reason: " ++ show exc)
       Right _ -> expectationFailure "No exception"
 
+  it "await rethrows an async kill instead of reporting a bug" do
+    -- A kill delivered while blocked in await is cancellation, not a defect.
+    tidVar <- newEmptyMVar
+    resVar <- newEmptyMVar
+    let spin :: Fx () Void ()
+        spin = runTotalIO $ \_ -> threadDelay 5000000
+        body :: Fx () Void ()
+        body = do
+          runTotalIO $ \_ -> myThreadId >>= putMVar tidVar
+          void $ concurrently $ \lift -> lift spin <|> lift spin
+    _ <- forkIO $ (try (runFx body) :: IO (Either FxException ())) >>= putMVar resVar
+    tid <- takeMVar tidVar
+    threadDelay 100000
+    throwTo tid ThreadKilled
+    res <- takeMVar resVar
+    case res of
+      Left (FxException _ (AsyncFxExceptionReason _) _) -> return ()
+      Left exc -> expectationFailure ("Wrong reason: " ++ show exc)
+      Right () -> expectationFailure "Async was swallowed"
+
   it "README Quick Start example runs" do
     user <- runFx $
       handleErr (\_ -> pure (User "fallback")) $

@@ -146,9 +146,12 @@ await (Future _ m) =
                 Left (Just err) -> return (Left err)
                 Left Nothing -> fail "Waiting for a future that crashed"
           )
-          ( \(exc :: SomeException) -> return $ do
-              crash callStack [] (BugFxExceptionReason (Strings.failedWaitingForResult exc))
-              fail "Thread crashed with uncaught exception waiting for result."
+          ( \(exc :: SomeException) ->
+              case fromException exc of
+                Just (asyncExc :: SomeAsyncException) -> throwIO asyncExc
+                Nothing -> return $ do
+                  crash callStack [] (BugFxExceptionReason (Strings.failedWaitingForResult exc))
+                  fail "Thread crashed with uncaught exception waiting for result."
           )
 
 cancel :: Future err res -> Fx env err' ()
