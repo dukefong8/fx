@@ -543,6 +543,43 @@ main = hspec do
       Right (Right _) -> expectationFailure "Throw was swallowed as a value"
       Left exc -> expectationFailure ("Unexpected failure: " ++ show exc)
 
+
+  it "worker-level async sweeps children and runs their releases" do
+    -- A dead worker must not leave its children running: they get killed,
+    -- their futures end up empty, and their scope releases run.
+    tidVar <- newEmptyMVar
+    ticksRef <- newIORef (0 :: Int)
+    childReleasedRef <- newIORef False
+    let childScope :: Scope Void ()
+        childScope = do
+          _ <- acquire (pure () :: Fx () Void ())
+          _ <- registerRelease (runTotalIO (\_ -> writeIORef childReleasedRef True) :: Fx () Void ())
+          pure ()
+        spin :: Fx () Void ()
+        spin = scoping childScope $ runTotalIO $ \_ -> forever (threadDelay 10000 >> modifyIORef' ticksRef (+ 1))
+        body :: Fx () Void ()
+        body = do
+          runTotalIO $ \_ -> myThreadId >>= putMVar tidVar
+          void $ bindM2 (\_ _ -> pure ()) spin (pure ())
+    resVar <- newEmptyMVar
+    _ <- forkIO $ (try (runFx body) :: IO (Either FxException ())) >>= putMVar resVar
+    tid <- takeMVar tidVar
+    threadDelay 150000
+    beforeKill <- readIORef ticksRef
+    beforeKill `shouldNotBe` 0
+    throwTo tid (ReviewAsyncException "worker-kill")
+    res <- takeMVar resVar
+    case res of
+      Left (FxException _ (AsyncFxExceptionReason _) _) -> return ()
+      Left exc -> expectationFailure ("Wrong exception: " ++ show exc)
+      Right () -> expectationFailure "Async was swallowed"
+    t1 <- readIORef ticksRef
+    threadDelay 300000
+    t2 <- readIORef ticksRef
+    t2 `shouldBe` t1
+    released <- pollUntil 2000000 (readIORef childReleasedRef)
+    released `shouldBe` True
+
 data ReviewAsyncException = ReviewAsyncException String
   deriving stock (Show, Typeable)
 
