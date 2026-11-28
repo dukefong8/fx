@@ -196,14 +196,21 @@ runFxInIO (Fx m) = uninterruptibleMask $ \unmask -> do
             ( \exc -> return $
                 case fromException exc of
                   -- An asynchronous exception that reached the worker, e.g. a
-                  -- kill during unmasked user IO. The worker is dying and cannot
-                  -- sweep itself, so it is excluded and the remaining threads
-                  -- are swept before the failure is delivered: children of this
-                  -- run must not outlive it. The post (not a rethrow) is what
-                  -- wakes the waiter, so this stays a `crash`.
+                  -- kill during unmasked user IO. If the registry entry is
+                  -- still unclaimed, this worker drops itself and owns the
+                  -- sweep, so children of the run do not outlive it. If the
+                  -- sweep already claimed it, the waiter is abandoning the run
+                  -- and sweeps the remaining threads itself. The post (not a
+                  -- rethrow) is what wakes the waiter, so this stays a `crash`.
                   Just (asyncExc :: SomeAsyncException) -> do
-                    atomically (modifyTVar' liveThreads (filter ((/= tid) . fst)))
-                    abandonRun liveThreads
+                    owned <- atomically do
+                      entries <- readTVar liveThreads
+                      case lookup tid entries of
+                        Just (ThreadPhase 0 Unclaimed) -> do
+                          writeTVar liveThreads (filter ((/= tid) . fst) entries)
+                          pure True
+                        _ -> pure False
+                    when owned (abandonRun liveThreads)
                     crash callStack [] (AsyncFxExceptionReason asyncExc)
                   Nothing -> case fromException exc of
                     -- Catch calls to `error`.
@@ -255,28 +262,49 @@ runFxInIO (Fx m) = uninterruptibleMask $ \unmask -> do
 -- sweep waits for delivery and absorbs the kill before its release runs, so
 -- no kill can land inside the release.
 --
--- Threads are claimed oldest-first (worker before children) so the worker
--- stops spawning new work before existing children are killed. Each kill
--- blocks until delivered, so a thread stuck in an uninterruptible mask
--- blocks both abandonment return and the remaining kills.
+-- Each pass claims every thread that is idle at that instant and kills them
+-- oldest-first, so the worker stops spawning new work before its children
+-- die. A pass repeats while it claimed something, which catches a thread
+-- that leaves cleanup during the sweep. A thread that leaves cleanup after
+-- the final pass's snapshot can still escape, the same best-effort limit as
+-- a child that registers after a snapshot.
+--
+-- Each kill blocks until delivered, so a thread stuck in an uninterruptible
+-- mask blocks both abandonment return and the remaining kills.
 --
 -- A @safe@ foreign call is not interruptible while it runs, so a thread
 -- blocked in one delays abandonment until the call returns. Use an
 -- interruptible foreign call for operations that must be cancellable.
 abandonRun :: TVar [(ThreadId, ThreadPhase)] -> IO ()
-abandonRun liveThreads = uninterruptibleMask_ $ do
-  tids <- reverse . map fst <$> atomically (readTVar liveThreads)
-  forM_ tids \tid -> do
-    claimed <- atomically $ do
-      entries <- readTVar liveThreads
-      case lookup tid entries of
-        Just (ThreadPhase 0 Unclaimed) -> do
-          writeTVar liveThreads (updatePhase tid (\p -> p {claimState = Claimed}) entries)
-          pure True
-        _ -> pure False
-    when claimed $ do
-      killThread tid `catch` \(_ :: SomeException) -> pure ()
-      atomically (modifyTVar' liveThreads (updatePhase tid (\p -> p {claimState = Delivered})))
+abandonRun liveThreads = uninterruptibleMask_ sweep
+  where
+    sweep = do
+      victims <- atomically $ do
+        entries <- readTVar liveThreads
+        let (victims, entries') = claimSweep entries
+        unless (null victims) (writeTVar liveThreads entries')
+        pure victims
+      unless (null victims) $ do
+        forM_ victims \tid -> do
+          killThread tid `catch` \(_ :: SomeException) -> pure ()
+          atomically (modifyTVar' liveThreads (updatePhase tid (\p -> p {claimState = Delivered})))
+        sweep
+
+-- |
+-- Select a sweep's victims, oldest first, and return the registry with
+-- their claims committed. Runs in a single pass: victims accumulate
+-- oldest-first already because the input is newest-first, while the
+-- surviving entries must be flipped back to preserve registry order.
+claimSweep :: [(ThreadId, ThreadPhase)] -> ([ThreadId], [(ThreadId, ThreadPhase)])
+claimSweep = go [] []
+  where
+    go victims rest [] = (victims, reverse rest)
+    go victims rest (entry@(tid, phase) : xs) =
+      case phase of
+        ThreadPhase 0 Unclaimed ->
+          let !claimed = phase {claimState = Claimed}
+           in go (tid : victims) ((tid, claimed) : rest) xs
+        _ -> go victims (entry : rest) xs
 
 updatePhase :: ThreadId -> (ThreadPhase -> ThreadPhase) -> [(ThreadId, ThreadPhase)] -> [(ThreadId, ThreadPhase)]
 updatePhase tid f = go

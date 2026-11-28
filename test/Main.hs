@@ -580,6 +580,65 @@ main = hspec do
     released <- pollUntil 2000000 (readIORef childReleasedRef)
     released `shouldBe` True
 
+  it "A thread that leaves cleanup during the sweep is killed and releases its outer resource" do
+    -- The sweep re-scans while new threads become claimable, so a child that
+    -- exits cleanup mid-sweep is caught in a later pass and its outer release
+    -- runs before the abandoned run returns.
+    outerReleasedRef <- newIORef False
+    ticksRef <- newIORef (0 :: Int)
+    inCleanupVar <- newEmptyMVar
+    releaseGate <- newEmptyMVar
+    workerTidVar <- newEmptyMVar
+    resVar <- newEmptyMVar
+    let outerScope :: Scope Void ()
+        outerScope = do
+          _ <- acquire (pure () :: Fx () Void ())
+          _ <- registerRelease (runTotalIO (\_ -> writeIORef outerReleasedRef True) :: Fx () Void ())
+          pure ()
+        innerScope :: Scope Void ()
+        innerScope = do
+          _ <- acquire (pure () :: Fx () Void ())
+          _ <- registerRelease
+            ( runTotalIO
+                ( \_ -> do
+                    putMVar inCleanupVar ()
+                    takeMVar releaseGate
+                ) ::
+                Fx () Void ()
+            )
+          pure ()
+        -- Holds the sweep open so the child can leave cleanup mid-sweep.
+        sibling :: Fx () Void ()
+        sibling = runTotalIO $ \_ -> uninterruptibleMask_ (threadDelay 500000)
+        child :: Fx () Void ()
+        child =
+          scoping outerScope $ do
+            scoping innerScope (pure ())
+            runTotalIO $ \_ -> forever (threadDelay 10000 >> modifyIORef' ticksRef (+ 1))
+        body :: Fx () Void ()
+        body = do
+          runTotalIO $ \_ -> myThreadId >>= putMVar workerTidVar
+          void $ concurrently $ \lift -> lift sibling <|> lift child
+    _ <- forkIO $ (try (runFx body) :: IO (Either SomeException ())) >>= putMVar resVar
+    workerTid <- takeMVar workerTidVar
+    takeMVar inCleanupVar
+    throwTo workerTid (ReviewAsyncException "sweep")
+    -- The snapshot is taken before the sibling's blocked kill returns.
+    threadDelay 100000
+    putMVar releaseGate ()
+    res <- takeMVar resVar
+    case res of
+      Left _ -> return ()
+      Right _ -> expectationFailure "run survived"
+    -- The child left cleanup mid-sweep, was caught by a later pass, and its
+    -- outer release ran instead of leaking.
+    released <- pollUntil 2000000 (readIORef outerReleasedRef)
+    released `shouldBe` True
+    t1 <- readIORef ticksRef
+    threadDelay 300000
+    t2 <- readIORef ticksRef
+    t2 `shouldBe` t1
+
 data ReviewAsyncException = ReviewAsyncException String
   deriving stock (Show, Typeable)
 
